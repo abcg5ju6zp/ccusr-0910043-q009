@@ -123,6 +123,34 @@ class ContentsHandler(ContentsAPIHandler):
             )
         require_hash = int(hash_str)
 
+        page_size_arg = self.get_query_argument("page_size", default=None)
+        cursor = self.get_query_argument("cursor", default=None) or None
+        paginated = page_size_arg is not None or cursor is not None
+        page_size = hash_budget = None
+        sort = sort_dir = None
+        if paginated:
+            if not content:
+                raise web.HTTPError(400, "page_size/cursor require content=1")
+            if type not in (None, "directory"):
+                raise web.HTTPError(400, "Pagination only applies to directory listings")
+            if page_size_arg is not None:
+                try:
+                    page_size = int(page_size_arg)
+                except ValueError:
+                    raise web.HTTPError(400, "page_size %r is invalid" % page_size_arg) from None
+            sort = self.get_query_argument("sort", default=None)
+            sort_dir = self.get_query_argument("sort_dir", default=None)
+            hash_budget_arg = self.get_query_argument("hash_budget", default=None)
+            if hash_budget_arg is not None:
+                try:
+                    hash_budget = int(hash_budget_arg)
+                except ValueError:
+                    raise web.HTTPError(
+                        400, "hash_budget %r is invalid" % hash_budget_arg
+                    ) from None
+                if hash_budget < 0:
+                    raise web.HTTPError(400, "hash_budget must be >= 0")
+
         if not cm.allow_hidden and await ensure_async(cm.is_hidden(path)):
             await self._finish_error(
                 HTTPStatus.NOT_FOUND, f"file or directory {path!r} does not exist"
@@ -130,30 +158,48 @@ class ContentsHandler(ContentsAPIHandler):
             return
 
         try:
-            expect_hash = require_hash
-            try:
+            if paginated:
+                # Bounded snapshot-cursor listing: the first request (no
+                # cursor) freezes the sort order and a watermark; later
+                # pages report continuity-breaking changes and re-check
+                # visibility against the live configuration.
                 model = await ensure_async(
-                    self.contents_manager.get(
+                    cm.get_page(
                         path=path,
-                        type=type,
-                        format=format,
-                        content=content,
-                        require_hash=require_hash,
+                        page_size=page_size,
+                        cursor=cursor,
+                        sort=sort,
+                        sort_dir=sort_dir,
+                        require_hash=bool(require_hash),
+                        hash_budget=hash_budget,
                     )
                 )
-            except TypeError:
-                # Fallback for ContentsManager not handling the require_hash argument
-                # introduced in 2.11
-                expect_hash = False
-                model = await ensure_async(
-                    self.contents_manager.get(
-                        path=path,
-                        type=type,
-                        format=format,
-                        content=content,
+                validate_model(model, expect_content=True, expect_hash=False)
+            else:
+                expect_hash = require_hash
+                try:
+                    model = await ensure_async(
+                        self.contents_manager.get(
+                            path=path,
+                            type=type,
+                            format=format,
+                            content=content,
+                            require_hash=require_hash,
+                        )
                     )
-                )
-            validate_model(model, expect_content=content, expect_hash=expect_hash)
+                except TypeError:
+                    # Fallback for ContentsManager not handling the require_hash argument
+                    # introduced in 2.11
+                    expect_hash = False
+                    model = await ensure_async(
+                        self.contents_manager.get(
+                            path=path,
+                            type=type,
+                            format=format,
+                            content=content,
+                        )
+                    )
+                validate_model(model, expect_content=content, expect_hash=expect_hash)
             self._finish_model(model, location=False)
         except web.HTTPError as exc:
             # 404 is okay in this context, catch exception and return 404 code to prevent stack trace on client

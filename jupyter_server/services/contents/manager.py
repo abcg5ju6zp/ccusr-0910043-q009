@@ -22,7 +22,9 @@ from traitlets import (
     Any,
     Bool,
     Dict,
+    Float,
     Instance,
+    Int,
     List,
     TraitError,
     Type,
@@ -38,8 +40,37 @@ from jupyter_server.utils import import_item
 
 from ...files.handlers import FilesHandler
 from .checkpoints import AsyncCheckpoints, Checkpoints
+from .pagination import (
+    CLASSIFY_LIMIT,
+    END,
+    ListingCursorStore,
+    compute_changes,
+    empty_changes,
+    slice_page,
+)
 
 copy_pat = re.compile(r"\-Copy\d*\.")
+
+
+def _page_payload(session, page, page_size, next_token):
+    """Assemble the ``page`` metadata dict of a paginated directory model."""
+    return {
+        "cursor": next_token,
+        "has_more": page["has_more"],
+        "page_size": page_size,
+        "returned": len(page["content"]),
+        "skipped": page["skipped"],
+        "sort": session.sort,
+        "sort_dir": session.sort_dir,
+        "hashes_deferred": page["hashes_deferred"],
+        "snapshot": {
+            "created": session.created_at,
+            "expires_at": session.expires_at(),
+            "entries": len(session.names),
+            "watermark": session.watermark_display,
+        },
+        "changes": page["changes"],
+    }
 
 
 class ContentsManager(LoggingConfigurable):
@@ -599,6 +630,344 @@ class ContentsManager(LoggingConfigurable):
         """项目内部接口说明。"""
         return not any(fnmatch(name, glob) for glob in self.hide_globs)
 
+    # Part 2b: paginated directory listings backed by bounded snapshot
+    # cursors.  The first page freezes a snapshot (entry names, a fixed
+    # sort order, and a watermark of the directory state); later pages are
+    # served from that snapshot so concurrent creations/deletions cannot
+    # duplicate or skip entries, while visibility rules are re-evaluated
+    # on every page so tightened permissions hide entries immediately.
+
+    listing_default_page_size = Int(
+        200,
+        config=True,
+        help="Default page size for paginated directory listings.",
+    )
+
+    listing_max_page_size = Int(
+        1000,
+        config=True,
+        help="Maximum accepted page size for paginated directory listings.",
+    )
+
+    listing_cursor_ttl = Float(
+        300.0,
+        config=True,
+        help="Idle seconds after which a listing cursor expires.",
+    )
+
+    listing_cursor_max_age = Float(
+        3600.0,
+        config=True,
+        help="Absolute lifetime in seconds of a listing cursor, regardless of activity.",
+    )
+
+    listing_cursor_max_sessions = Int(
+        32,
+        config=True,
+        help="Maximum number of concurrent listing cursors; least recently used cursors are evicted.",
+    )
+
+    listing_snapshot_max_entries = Int(
+        100000,
+        config=True,
+        help="Maximum directory size accepted for a paginated listing; larger directories are rejected with 413.",
+    )
+
+    listing_hash_budget_max = Int(
+        128,
+        config=True,
+        help="Maximum number of entry hashes computed per page of a paginated listing.",
+    )
+
+    _listing_cursor_store: ListingCursorStore | None = None
+
+    @property
+    def listing_cursor_store(self) -> ListingCursorStore:
+        """The bounded, process-local store of listing sessions."""
+        if self._listing_cursor_store is None:
+            self._listing_cursor_store = ListingCursorStore(
+                max_sessions=self.listing_cursor_max_sessions,
+                ttl=self.listing_cursor_ttl,
+                max_age=self.listing_cursor_max_age,
+            )
+        return self._listing_cursor_store
+
+    def get_page(
+        self,
+        path,
+        page_size=None,
+        cursor=None,
+        sort=None,
+        sort_dir=None,
+        require_hash=False,
+        hash_budget=None,
+    ):
+        """Get one page of a directory listing through a bounded snapshot cursor.
+
+        With ``cursor=None`` a new snapshot session is started: entry names,
+        the sort order (``sort``/``sort_dir``), and a watermark of the
+        directory state are frozen, and the first page is returned together
+        with an opaque cursor in ``model["page"]["cursor"]``.  Passing that
+        cursor back serves the following pages from the frozen snapshot, so
+        concurrent additions/removals neither duplicate nor skip entries;
+        the ``page.changes`` summary reports which continuity-relevant
+        changes the live directory has seen since the snapshot.
+
+        Visibility (``allow_hidden``, ``hide_globs``, hidden files) is
+        re-evaluated on every page, so permissions tightened mid-pagination
+        hide entries immediately.  Entry hashes are computed lazily, bounded
+        by ``hash_budget`` (itself capped by ``listing_hash_budget_max``);
+        entries beyond the budget get ``hash=None`` and the page is flagged
+        with ``hashes_deferred``.
+
+        Cursors are bounded (idle TTL, absolute age, max sessions) and
+        process-local: expired, evicted, or post-restart cursors raise 410,
+        consumed cursors outside the retry window raise 409.  Re-presenting
+        a recently consumed cursor replays its page idempotently.
+        """
+        path = path.strip("/")
+        store = self.listing_cursor_store
+
+        if cursor is None:
+            sort = sort or "name"
+            sort_dir = sort_dir or "asc"
+            self._check_sort(sort, sort_dir)
+            page_size = self._check_page_size(page_size)
+            if not self.dir_exists(path):
+                if self.file_exists(path):
+                    raise HTTPError(400, "%s is not a directory" % path, reason="bad type")
+                raise HTTPError(404, "directory does not exist: %r" % path)
+            if not self.allow_hidden and self.is_hidden(path):
+                raise HTTPError(404, "directory does not exist: %r" % path)
+            keys, names, raw_names, wm_sig, wm_display = self._dir_snapshot(path, sort)
+            if len(raw_names) > self.listing_snapshot_max_entries:
+                raise HTTPError(
+                    413,
+                    "directory %r has %d entries, exceeding the listing snapshot "
+                    "limit of %d" % (path, len(raw_names), self.listing_snapshot_max_entries),
+                )
+            session = store.create_session(
+                path=path,
+                sort=sort,
+                sort_dir=sort_dir,
+                page_size=page_size,
+                keys=keys,
+                names=names,
+                raw_names=raw_names,
+                watermark_signature=wm_sig,
+                watermark_display=wm_display,
+            )
+            position_key = None
+            advance = True
+            consumed_token = None
+            replay_next_token = None
+        else:
+            session = store.locate(cursor)
+            if session.path != path:
+                raise HTTPError(
+                    400,
+                    "Listing cursor belongs to a different directory: %r" % session.path,
+                )
+            if sort is not None and sort != session.sort:
+                raise HTTPError(
+                    400,
+                    "sort %r does not match the sort order fixed by the first page (%r)"
+                    % (sort, session.sort),
+                )
+            if sort_dir is not None and sort_dir != session.sort_dir:
+                raise HTTPError(
+                    400,
+                    "sort_dir %r does not match the sort order fixed by the first page (%r)"
+                    % (sort_dir, session.sort_dir),
+                )
+            page_size = (
+                self._check_page_size(page_size) if page_size is not None else session.page_size
+            )
+            position_key, advance, replay_next_token = session.classify(cursor)
+            consumed_token = cursor if advance else None
+
+        page = self._serve_page(
+            session, position_key, page_size, require_hash, hash_budget, is_first=cursor is None
+        )
+
+        if advance:
+            next_token = session.issue(position_key, consumed_token, page["new_position_key"])
+        else:
+            next_token = replay_next_token
+        session.touch()
+
+        model = self.get(path, content=False)
+        model["content"] = page["content"]
+        model["format"] = "json"
+        model["page"] = _page_payload(session, page, page_size, next_token)
+        return model
+
+    def _check_page_size(self, page_size):
+        """Validate an explicit page size, or return the configured default."""
+        if page_size is None:
+            return self.listing_default_page_size
+        if not 1 <= page_size <= self.listing_max_page_size:
+            raise HTTPError(
+                400,
+                "page_size must be between 1 and %d" % self.listing_max_page_size,
+            )
+        return page_size
+
+    def _check_sort(self, sort, sort_dir):
+        """Validate the sort order fixed by the first page of a listing."""
+        if sort not in ("name", "last_modified"):
+            raise HTTPError(400, "sort %r is invalid; must be 'name' or 'last_modified'" % sort)
+        if sort_dir not in ("asc", "desc"):
+            raise HTTPError(400, "sort_dir %r is invalid; must be 'asc' or 'desc'" % sort_dir)
+
+    def _name_visible(self, name):
+        """Cheap name-based visibility check applied to the whole snapshot."""
+        return self.should_list(name) and (self.allow_hidden or not name.startswith("."))
+
+    def _serve_page(self, session, position_key, page_size, require_hash, hash_budget, is_first):
+        """Build one page of entry models out of the session snapshot."""
+        fingerprint = (self.allow_hidden, tuple(self.hide_globs))
+        fkeys, fnames = session.filtered_view(fingerprint, self._name_visible)
+        page_names, new_position_key, has_more = slice_page(
+            fkeys, fnames, position_key, page_size, session.sort_dir
+        )
+
+        budget = 0
+        if require_hash:
+            budget = self.listing_hash_budget_max if hash_budget is None else hash_budget
+            budget = max(0, min(budget, self.listing_hash_budget_max))
+
+        content = []
+        skipped = 0
+        hashed = 0
+        hashes_deferred = False
+        for name in page_names:
+            entry_path = f"{session.path}/{name}"
+            try:
+                # Re-check visibility live: permissions tightened since the
+                # snapshot must hide the entry from this page already.
+                if not self.allow_hidden and self.is_hidden(entry_path):
+                    skipped += 1
+                    continue
+                if not self._entry_listable(entry_path, name):
+                    skipped += 1
+                    continue
+                want_hash = require_hash and hashed < budget
+                entry_model = self._entry_model(entry_path, want_hash)
+            except HTTPError as e:
+                if e.status_code in (403, 404):
+                    # Vanished, hidden, or unreadable since the snapshot.
+                    skipped += 1
+                    continue
+                raise
+            except OSError:
+                skipped += 1
+                continue
+            if want_hash and entry_model.get("hash") is not None:
+                hashed += 1
+            if (
+                require_hash
+                and entry_model.get("type") != "directory"
+                and entry_model.get("hash") is None
+            ):
+                hashes_deferred = True
+            content.append(entry_model)
+
+        changes = None if is_first else self._session_changes(session)
+        return {
+            "content": content,
+            "skipped": skipped,
+            "hashes_deferred": hashes_deferred,
+            "new_position_key": new_position_key,
+            "has_more": has_more,
+            "changes": changes,
+        }
+
+    def _session_changes(self, session):
+        """Change summary of the live directory against the session watermark."""
+        try:
+            signature = self._dir_signature(session.path)
+            if signature == session.watermark_signature:
+                return empty_changes()
+            cached = session.changes_cache.get(signature)
+            if cached is not None:
+                session.changes_cache.move_to_end(signature)
+                return cached
+            current_names = self._dir_entry_names(session.path)
+        except OSError:
+            raise HTTPError(404, "directory no longer exists: %r" % session.path) from None
+        changes = compute_changes(
+            session,
+            current_names,
+            visible=self._name_visible,
+            added_keys=self._added_key_map(session, current_names),
+        )
+        session.changes_cache[signature] = changes
+        while len(session.changes_cache) > 4:
+            session.changes_cache.popitem(last=False)
+        return changes
+
+    def _added_key_map(self, session, current_names):
+        """Sort keys for newly appeared entries, bounded by CLASSIFY_LIMIT."""
+        if session.sort == "name":
+            return {}
+        keys = {}
+        added = [n for n in current_names if n not in session.raw_name_set]
+        for name in added[:CLASSIFY_LIMIT]:
+            try:
+                keys[name] = self._entry_sort_key(session.path, name)
+            except (HTTPError, OSError):
+                continue
+        return keys
+
+    # Primitives the paginated flow relies on; the default implementations
+    # go through the regular contents API, and file-based managers override
+    # them with cheaper direct versions.
+
+    def _dir_snapshot(self, path, sort):
+        """Freeze a directory snapshot: (keys, names, raw_names, signature, display)."""
+        model = self.get(path, content=True)
+        entries = model.get("content") or []
+        raw_names = [entry["name"] for entry in entries]
+        if sort == "name":
+            pairs = sorted((entry["name"], entry["name"]) for entry in entries)
+        else:
+            pairs = sorted(
+                ((entry["last_modified"], entry["name"]), entry["name"]) for entry in entries
+            )
+        keys = [key for key, _ in pairs]
+        names = [name for _, name in pairs]
+        signature = (str(model.get("last_modified")), len(entries))
+        display = {"last_modified": model.get("last_modified"), "entry_count": len(entries)}
+        return keys, names, raw_names, signature, display
+
+    def _dir_signature(self, path):
+        """A cheap, hashable signature of the current directory state."""
+        model = self.get(path, content=False)
+        return (str(model.get("last_modified")),)
+
+    def _dir_entry_names(self, path):
+        """The current entry names of the directory."""
+        model = self.get(path, content=True)
+        return [entry["name"] for entry in model.get("content") or []]
+
+    def _entry_model(self, path, require_hash):
+        """The contents model of a single entry."""
+        try:
+            return self.get(path, content=False, require_hash=require_hash)
+        except TypeError:
+            # ContentsManager not handling the require_hash argument.
+            return self.get(path, content=False)
+
+    def _entry_listable(self, path, name):
+        """Whether an entry may appear in a listing (type checks etc.)."""
+        return True
+
+    def _entry_sort_key(self, path, name):
+        """The sort key of a newly appeared entry, for change classification."""
+        model = self.get(f"{path}/{name}", content=False)
+        return (model["last_modified"], name)
+
     # Part 3: Checkpoints API
     def create_checkpoint(self, path):
         """项目内部接口说明。"""
@@ -821,6 +1190,242 @@ class AsyncContentsManager(ContentsManager):
         self.log.warning("Trusting notebook %s", path)
         self.notary.mark_cells(nb, True)
         self.check_and_sign(nb, path)
+
+    # Part 2b: paginated directory listings; see ContentsManager.get_page
+    # for the contract.  This async variant serializes concurrent requests
+    # against the same session so a retried page cannot fork the cursor.
+
+    async def get_page(
+        self,
+        path,
+        page_size=None,
+        cursor=None,
+        sort=None,
+        sort_dir=None,
+        require_hash=False,
+        hash_budget=None,
+    ):
+        """Get one page of a directory listing through a bounded snapshot cursor."""
+        path = path.strip("/")
+        store = self.listing_cursor_store
+
+        if cursor is None:
+            sort = sort or "name"
+            sort_dir = sort_dir or "asc"
+            self._check_sort(sort, sort_dir)
+            page_size = self._check_page_size(page_size)
+            if not await ensure_async(self.dir_exists(path)):
+                if await ensure_async(self.file_exists(path)):
+                    raise HTTPError(400, "%s is not a directory" % path, reason="bad type")
+                raise HTTPError(404, "directory does not exist: %r" % path)
+            if not self.allow_hidden and await ensure_async(self.is_hidden(path)):
+                raise HTTPError(404, "directory does not exist: %r" % path)
+            keys, names, raw_names, wm_sig, wm_display = await self._dir_snapshot(path, sort)
+            if len(raw_names) > self.listing_snapshot_max_entries:
+                raise HTTPError(
+                    413,
+                    "directory %r has %d entries, exceeding the listing snapshot "
+                    "limit of %d" % (path, len(raw_names), self.listing_snapshot_max_entries),
+                )
+            session = store.create_session(
+                path=path,
+                sort=sort,
+                sort_dir=sort_dir,
+                page_size=page_size,
+                keys=keys,
+                names=names,
+                raw_names=raw_names,
+                watermark_signature=wm_sig,
+                watermark_display=wm_display,
+            )
+        else:
+            session = store.locate(cursor)
+            if session.path != path:
+                raise HTTPError(
+                    400,
+                    "Listing cursor belongs to a different directory: %r" % session.path,
+                )
+            if sort is not None and sort != session.sort:
+                raise HTTPError(
+                    400,
+                    "sort %r does not match the sort order fixed by the first page (%r)"
+                    % (sort, session.sort),
+                )
+            if sort_dir is not None and sort_dir != session.sort_dir:
+                raise HTTPError(
+                    400,
+                    "sort_dir %r does not match the sort order fixed by the first page (%r)"
+                    % (sort_dir, session.sort_dir),
+                )
+            page_size = (
+                self._check_page_size(page_size) if page_size is not None else session.page_size
+            )
+
+        async with session.lock:
+            if cursor is None:
+                position_key, advance, consumed_token, replay_next_token = None, True, None, None
+            else:
+                position_key, advance, replay_next_token = session.classify(cursor)
+                consumed_token = cursor if advance else None
+            page = await self._serve_page(
+                session, position_key, page_size, require_hash, hash_budget, is_first=cursor is None
+            )
+            if advance:
+                next_token = session.issue(position_key, consumed_token, page["new_position_key"])
+            else:
+                next_token = replay_next_token
+            session.touch()
+
+        model = await self.get(path, content=False)
+        model["content"] = page["content"]
+        model["format"] = "json"
+        model["page"] = _page_payload(session, page, page_size, next_token)
+        return model
+
+    async def _serve_page(
+        self, session, position_key, page_size, require_hash, hash_budget, is_first
+    ):
+        """Build one page of entry models out of the session snapshot."""
+        fingerprint = (self.allow_hidden, tuple(self.hide_globs))
+        fkeys, fnames = session.filtered_view(fingerprint, self._name_visible)
+        page_names, new_position_key, has_more = slice_page(
+            fkeys, fnames, position_key, page_size, session.sort_dir
+        )
+
+        budget = 0
+        if require_hash:
+            budget = self.listing_hash_budget_max if hash_budget is None else hash_budget
+            budget = max(0, min(budget, self.listing_hash_budget_max))
+
+        content = []
+        skipped = 0
+        hashed = 0
+        hashes_deferred = False
+        for name in page_names:
+            entry_path = f"{session.path}/{name}"
+            try:
+                # Re-check visibility live: permissions tightened since the
+                # snapshot must hide the entry from this page already.
+                if not self.allow_hidden and await ensure_async(self.is_hidden(entry_path)):
+                    skipped += 1
+                    continue
+                if not await self._entry_listable(entry_path, name):
+                    skipped += 1
+                    continue
+                want_hash = require_hash and hashed < budget
+                entry_model = await self._entry_model(entry_path, want_hash)
+            except HTTPError as e:
+                if e.status_code in (403, 404):
+                    # Vanished, hidden, or unreadable since the snapshot.
+                    skipped += 1
+                    continue
+                raise
+            except OSError:
+                skipped += 1
+                continue
+            if want_hash and entry_model.get("hash") is not None:
+                hashed += 1
+            if (
+                require_hash
+                and entry_model.get("type") != "directory"
+                and entry_model.get("hash") is None
+            ):
+                hashes_deferred = True
+            content.append(entry_model)
+
+        changes = None if is_first else await self._session_changes(session)
+        return {
+            "content": content,
+            "skipped": skipped,
+            "hashes_deferred": hashes_deferred,
+            "new_position_key": new_position_key,
+            "has_more": has_more,
+            "changes": changes,
+        }
+
+    async def _session_changes(self, session):
+        """Change summary of the live directory against the session watermark."""
+        try:
+            signature = await self._dir_signature(session.path)
+            if signature == session.watermark_signature:
+                return empty_changes()
+            cached = session.changes_cache.get(signature)
+            if cached is not None:
+                session.changes_cache.move_to_end(signature)
+                return cached
+            current_names = await self._dir_entry_names(session.path)
+        except OSError:
+            raise HTTPError(404, "directory no longer exists: %r" % session.path) from None
+        changes = compute_changes(
+            session,
+            current_names,
+            visible=self._name_visible,
+            added_keys=await self._added_key_map(session, current_names),
+        )
+        session.changes_cache[signature] = changes
+        while len(session.changes_cache) > 4:
+            session.changes_cache.popitem(last=False)
+        return changes
+
+    async def _added_key_map(self, session, current_names):
+        """Sort keys for newly appeared entries, bounded by CLASSIFY_LIMIT."""
+        if session.sort == "name":
+            return {}
+        keys = {}
+        added = [n for n in current_names if n not in session.raw_name_set]
+        for name in added[:CLASSIFY_LIMIT]:
+            try:
+                keys[name] = await self._entry_sort_key(session.path, name)
+            except (HTTPError, OSError):
+                continue
+        return keys
+
+    # Primitives the paginated flow relies on; see ContentsManager for the
+    # synchronous default implementations.
+
+    async def _dir_snapshot(self, path, sort):
+        """Freeze a directory snapshot: (keys, names, raw_names, signature, display)."""
+        model = await self.get(path, content=True)
+        entries = model.get("content") or []
+        raw_names = [entry["name"] for entry in entries]
+        if sort == "name":
+            pairs = sorted((entry["name"], entry["name"]) for entry in entries)
+        else:
+            pairs = sorted(
+                ((entry["last_modified"], entry["name"]), entry["name"]) for entry in entries
+            )
+        keys = [key for key, _ in pairs]
+        names = [name for _, name in pairs]
+        signature = (str(model.get("last_modified")), len(entries))
+        display = {"last_modified": model.get("last_modified"), "entry_count": len(entries)}
+        return keys, names, raw_names, signature, display
+
+    async def _dir_signature(self, path):
+        """A cheap, hashable signature of the current directory state."""
+        model = await self.get(path, content=False)
+        return (str(model.get("last_modified")),)
+
+    async def _dir_entry_names(self, path):
+        """The current entry names of the directory."""
+        model = await self.get(path, content=True)
+        return [entry["name"] for entry in model.get("content") or []]
+
+    async def _entry_model(self, path, require_hash):
+        """The contents model of a single entry."""
+        try:
+            return await self.get(path, content=False, require_hash=require_hash)
+        except TypeError:
+            # ContentsManager not handling the require_hash argument.
+            return await self.get(path, content=False)
+
+    async def _entry_listable(self, path, name):
+        """Whether an entry may appear in a listing (type checks etc.)."""
+        return True
+
+    async def _entry_sort_key(self, path, name):
+        """The sort key of a newly appeared entry, for change classification."""
+        model = await self.get(f"{path}/{name}", content=False)
+        return (model["last_modified"], name)
 
     # Part 3: Checkpoints API
     async def create_checkpoint(self, path):

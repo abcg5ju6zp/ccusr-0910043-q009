@@ -313,6 +313,79 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
 
         return model
 
+    # Primitives for paginated listings (see ContentsManager.get_page).
+    # These avoid building any per-entry models while snapshotting: a
+    # name-sorted snapshot is a single listdir + stat of the directory.
+
+    def _dir_snapshot(self, path, sort):
+        """Freeze a directory snapshot straight from the filesystem."""
+        os_path = self._get_os_path(path)
+        try:
+            raw_names = os.listdir(os_path)
+            dir_stat = os.stat(os_path)
+        except FileNotFoundError:
+            raise web.HTTPError(404, "directory does not exist: %r" % path) from None
+        if sort == "name":
+            names = sorted(raw_names)
+            keys = list(names)
+        else:
+            pairs = []
+            for name in raw_names:
+                try:
+                    entry_stat = os.lstat(os.path.join(os_path, name))
+                except OSError:
+                    # Vanished or unreadable while snapshotting; leave it
+                    # out of the servable snapshot.
+                    continue
+                pairs.append(((entry_stat.st_mtime_ns, name), name))
+            pairs.sort()
+            keys = [key for key, _ in pairs]
+            names = [name for _, name in pairs]
+        signature = (dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
+        display = {
+            "mtime_ns": dir_stat.st_mtime_ns,
+            "ctime_ns": dir_stat.st_ctime_ns,
+            "entry_count": len(raw_names),
+        }
+        return keys, names, raw_names, signature, display
+
+    def _dir_signature(self, path):
+        """Directory mtime/ctime pair, the cheap half of the watermark."""
+        dir_stat = os.stat(self._get_os_path(path))
+        return (dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
+
+    def _dir_entry_names(self, path):
+        """The current entry names of the directory."""
+        return os.listdir(self._get_os_path(path))
+
+    def _entry_listable(self, path, name):
+        """Filesystem checks mirroring _dir_model: type and hidden state."""
+        os_path = self._get_os_path(path)
+        try:
+            st = os.lstat(os_path)
+        except OSError as e:
+            # skip over broken symlinks in listing
+            if e.errno == errno.ENOENT:
+                self.log.warning("%s doesn't exist", os_path)
+            elif e.errno != errno.EACCES:  # Don't provide clues about protected files
+                self.log.warning("Error stat-ing %s: %r", os_path, e)
+            return False
+
+        if (
+            not stat.S_ISLNK(st.st_mode)
+            and not stat.S_ISREG(st.st_mode)
+            and not stat.S_ISDIR(st.st_mode)
+        ):
+            self.log.debug("%s not a regular file", os_path)
+            return False
+
+        return self.allow_hidden or not is_file_hidden(os_path, stat_res=st)
+
+    def _entry_sort_key(self, path, name):
+        """The (mtime_ns, name) sort key of a newly appeared entry."""
+        entry_stat = os.lstat(os.path.join(self._get_os_path(path), name))
+        return (entry_stat.st_mtime_ns, name)
+
     def _file_model(self, path, content=True, format=None, require_hash=False):
         """项目内部接口说明。"""
         model = self._base_model(path)
@@ -731,6 +804,29 @@ class AsyncFileContentsManager(  # type: ignore[misc]
             model["format"] = "json"
 
         return model
+
+    # Primitives for paginated listings, delegating to the synchronous
+    # filesystem implementations in a worker thread.
+
+    async def _dir_snapshot(self, path, sort):
+        """Freeze a directory snapshot straight from the filesystem."""
+        return await run_sync(FileContentsManager._dir_snapshot, self, path, sort)
+
+    async def _dir_signature(self, path):
+        """Directory mtime/ctime pair, the cheap half of the watermark."""
+        return await run_sync(FileContentsManager._dir_signature, self, path)
+
+    async def _dir_entry_names(self, path):
+        """The current entry names of the directory."""
+        return await run_sync(FileContentsManager._dir_entry_names, self, path)
+
+    async def _entry_listable(self, path, name):
+        """Filesystem checks mirroring _dir_model: type and hidden state."""
+        return await run_sync(FileContentsManager._entry_listable, self, path, name)
+
+    async def _entry_sort_key(self, path, name):
+        """The (mtime_ns, name) sort key of a newly appeared entry."""
+        return await run_sync(FileContentsManager._entry_sort_key, self, path, name)
 
     async def _file_model(self, path, content=True, format=None, require_hash=False):
         """项目内部接口说明。"""
