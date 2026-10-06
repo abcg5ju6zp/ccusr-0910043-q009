@@ -18,6 +18,8 @@ from jupyter_server.auth.decorator import allow_unauthenticated, authorized
 from jupyter_server.base.handlers import APIHandler, JupyterHandler, path_regex
 from jupyter_server.utils import url_escape, url_path_join
 
+from .listing import ListingCursorError
+
 AUTH_RESOURCE = "contents"
 
 
@@ -90,6 +92,61 @@ class ContentsHandler(ContentsAPIHandler):
         self.set_header("Content-Type", "application/json")
         self.finish(json.dumps(model, default=json_default))
 
+    @staticmethod
+    def _parse_listing_int(name, value, minimum):
+        """解析分页相关的整数查询参数,非法时返回明确的 400。"""
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            raise web.HTTPError(
+                400, f"{name} argument {value!r} is invalid. It must be an integer."
+            ) from None
+        if parsed < minimum:
+            raise web.HTTPError(
+                400, f"{name} argument {value!r} is invalid. It must be >= {minimum}."
+            )
+        return parsed
+
+    async def _get_listing_page(
+        self,
+        path,
+        *,
+        content,
+        page_size_arg,
+        cursor_arg,
+        sort_arg,
+        hash_budget_arg,
+        require_hash,
+    ):
+        """按有界快照游标获取目录清单的一页(详见 filemanager.get_listing_page)。"""
+        if not content:
+            raise web.HTTPError(400, "Paginated listings require content=1 (the default).")
+        page_size = self._parse_listing_int("page_size", page_size_arg, minimum=1)
+        hash_budget = self._parse_listing_int("hash_budget", hash_budget_arg, minimum=0)
+        get_listing_page = getattr(self.contents_manager, "get_listing_page", None)
+        if get_listing_page is None:
+            raise web.HTTPError(
+                400,
+                f"The {type(self.contents_manager).__name__} contents manager does not "
+                "support paginated directory listings.",
+            )
+        try:
+            return await ensure_async(
+                get_listing_page(
+                    path=path,
+                    page_size=page_size,
+                    cursor=cursor_arg,
+                    sort=sort_arg,
+                    require_hash=require_hash,
+                    hash_budget=hash_budget,
+                )
+            )
+        except ListingCursorError as e:
+            # 游标过期/服务重启/参数不匹配等,均以明确的状态码与原因返回。
+            raise web.HTTPError(e.status_code, log_message=str(e), reason=e.reason) from e
+
     async def _finish_error(self, code, message):
         """项目内部接口说明。"""
         self.set_status(code)
@@ -123,6 +180,17 @@ class ContentsHandler(ContentsAPIHandler):
             )
         require_hash = int(hash_str)
 
+        # 分页参数:缺省时走原有的整目录读取路径,行为完全不变。
+        page_size_arg = self.get_query_argument("page_size", default=None)
+        cursor_arg = self.get_query_argument("cursor", default=None)
+        sort_arg = self.get_query_argument("sort", default=None)
+        hash_budget_arg = self.get_query_argument("hash_budget", default=None)
+        paginated = page_size_arg is not None or cursor_arg is not None
+        if not paginated and (sort_arg is not None or hash_budget_arg is not None):
+            raise web.HTTPError(
+                400, "The 'sort' and 'hash_budget' arguments require 'page_size' or 'cursor'."
+            )
+
         if not cm.allow_hidden and await ensure_async(cm.is_hidden(path)):
             await self._finish_error(
                 HTTPStatus.NOT_FOUND, f"file or directory {path!r} does not exist"
@@ -130,6 +198,19 @@ class ContentsHandler(ContentsAPIHandler):
             return
 
         try:
+            if paginated:
+                model = await self._get_listing_page(
+                    path,
+                    content=content,
+                    page_size_arg=page_size_arg,
+                    cursor_arg=cursor_arg,
+                    sort_arg=sort_arg,
+                    hash_budget_arg=hash_budget_arg,
+                    require_hash=require_hash,
+                )
+                validate_model(model, expect_content=True)
+                self._finish_model(model, location=False)
+                return
             expect_hash = require_hash
             try:
                 model = await ensure_async(

@@ -33,6 +33,7 @@ from jupyter_server.utils import to_api_path
 
 from .filecheckpoints import AsyncFileCheckpoints, FileCheckpoints
 from .fileio import AsyncFileManagerMixin, FileManagerMixin
+from .listing import ListingCursorStore, build_pagination_payload
 from .manager import AsyncContentsManager, ContentsManager, copy_pat
 
 try:
@@ -132,6 +133,50 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         deleted. If False (default), the non-empty directory will be sent to the trash only
         if safe. And if ``delete_to_trash`` is True, the directory won't be deleted.""",
     )
+
+    listing_page_size_max = Int(
+        10000,
+        config=True,
+        help="""Upper bound on the page_size accepted for paginated directory listings.""",
+    )
+
+    listing_cursor_ttl = Int(
+        600,
+        config=True,
+        help="""Seconds a paginated-listing snapshot cursor stays valid after its
+        last use. Expired cursors are rejected with an explicit 410 error.""",
+    )
+
+    listing_max_cursors = Int(
+        128,
+        config=True,
+        help="""Maximum number of live paginated-listing snapshots kept in memory;
+        the least recently used snapshots are evicted beyond this bound.""",
+    )
+
+    listing_max_snapshot_entries = Int(
+        1000000,
+        config=True,
+        help="""Maximum number of entries a single paginated-listing snapshot may
+        hold. Larger directories are rejected with an explicit 413 error so that
+        snapshot memory stays bounded.""",
+    )
+
+    @property
+    def _listing_store(self):
+        """分页快照仓库(按管理器实例惰性创建,仅驻留内存)。
+
+        服务重启后仓库随进程消失,旧游标会得到明确的 server_restarted 错误。
+        """
+        store = self.__dict__.get("_listing_cursor_store")
+        if store is None:
+            store = ListingCursorStore(
+                ttl=self.listing_cursor_ttl,
+                max_cursors=self.listing_max_cursors,
+                max_entries=self.listing_max_snapshot_entries,
+            )
+            self.__dict__["_listing_cursor_store"] = store
+        return store
 
     @default("files_handler_class")
     def _files_handler_class_default(self):
@@ -396,6 +441,164 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
             model = self._file_model(
                 path, content=content, format=format, require_hash=require_hash
             )
+        self.emit(data={"action": "get", "path": path})
+        return model
+
+    def _scan_listing_dir(self, os_dir, sort=None):
+        """扫描目录,返回 (全部原始名称, 当前可服务条目名称)。
+
+        可服务 = 常规文件/目录/符号链接、未被 hide_globs 排除、未隐藏。
+        权限与过滤策略在每次扫描时实时评估,因此翻页中途权限收紧会
+        立即反映为条目不可见。``sort`` 为 "name"/"size"/"last_modified"
+        时对可见名称排序(以名称作确定性决胜键);为 None 时不排序。
+        """
+        raw_names = os.listdir(os_dir)
+        visible: list[tuple[t.Any, str]] = []
+        for name in raw_names:
+            try:
+                child_os_path = os.path.join(os_dir, name)
+            except UnicodeDecodeError as e:
+                self.log.warning("failed to decode filename '%s': %r", name, e)
+                continue
+
+            try:
+                st = os.lstat(child_os_path)
+            except OSError as e:
+                # skip over broken symlinks in listing
+                if e.errno == errno.ENOENT:
+                    self.log.warning("%s doesn't exist", child_os_path)
+                elif e.errno != errno.EACCES:  # Don't provide clues about protected files
+                    self.log.warning("Error stat-ing %s: %r", child_os_path, e)
+                continue
+
+            if (
+                not stat.S_ISLNK(st.st_mode)
+                and not stat.S_ISREG(st.st_mode)
+                and not stat.S_ISDIR(st.st_mode)
+            ):
+                self.log.debug("%s not a regular file", child_os_path)
+                continue
+
+            if not self.should_list(name):
+                continue
+            if not self.allow_hidden and is_file_hidden(child_os_path, stat_res=st):
+                continue
+
+            if sort == "size":
+                visible.append(((st.st_size, name), name))
+            elif sort == "last_modified":
+                visible.append(((st.st_mtime, name), name))
+            else:
+                visible.append((name, name))
+
+        if sort is not None:
+            visible.sort(key=lambda item: item[0])
+        return raw_names, [name for _, name in visible]
+
+    def _validate_listing_request(self, path, sort, page_size):
+        """校验分页请求的公共前提,返回目录的 OS 路径。"""
+        if sort is not None and sort not in ("name", "size", "last_modified"):
+            raise web.HTTPError(
+                400,
+                f"Invalid listing sort {sort!r}; expected one of 'name', 'size', 'last_modified'.",
+            )
+        if page_size is not None and not 1 <= page_size <= self.listing_page_size_max:
+            raise web.HTTPError(
+                400,
+                f"page_size must be between 1 and {self.listing_page_size_max}, got {page_size}.",
+            )
+        os_path = self._get_os_path(path)
+        four_o_four = "directory does not exist: %r" % path
+        if not os.path.isdir(os_path):
+            raise web.HTTPError(404, four_o_four)
+        if not self.allow_hidden and is_hidden(os_path, self.root_dir):
+            self.log.info("Refusing to serve hidden directory %r, via 404 Error", os_path)
+            raise web.HTTPError(404, four_o_four)
+        return os_path
+
+    def get_listing_page(
+        self,
+        path,
+        page_size=None,
+        cursor=None,
+        sort=None,
+        require_hash=False,
+        hash_budget=None,
+    ):
+        """按有界快照游标返回目录清单的一页。
+
+        首页(无 ``cursor``)固定排序依据与可见水位(快照);后续页用首页
+        签发的游标定位,重新扫描目录以识别删除/新增/权限收紧等破坏连续性
+        的变化,并按当前权限即时隐藏条目。哈希等昂贵元数据按
+        ``hash_budget`` 预算计算,超出预算的条目留空待客户端按需补取。
+        """
+        path = path.strip("/")
+        os_path = self._validate_listing_request(path, sort, page_size)
+
+        store = self._listing_store
+        try:
+            if cursor is None:
+                if page_size is None:
+                    raise web.HTTPError(400, "page_size is required to start a paginated listing.")
+                sort = sort or "name"
+                raw_names, visible_names = self._scan_listing_dir(os_path, sort=sort)
+                snapshot = store.create(
+                    path=path, names=visible_names, sort=sort, page_size=page_size
+                )
+                page_index = 0
+            else:
+                snapshot, page_index = store.resolve(
+                    cursor, path=path, sort=sort, page_size=page_size
+                )
+                raw_names, visible_names = self._scan_listing_dir(os_path)
+        except PermissionError as e:
+            raise web.HTTPError(403, f"Permission denied while listing directory: {path!r}") from e
+
+        start = page_index * snapshot.page_size
+        page_names = snapshot.names[start : start + snapshot.page_size]
+        visible_set = set(visible_names)
+
+        content = []
+        hashes_computed = 0
+        for name in page_names:
+            if name not in visible_set:
+                # 快照后被删除或权限收紧不再可见;在 changes 中统一通报。
+                continue
+            child_path = f"{path}/{name}" if path else name
+            want_hash = require_hash and (hash_budget is None or hashes_computed < hash_budget)
+            try:
+                entry = self.get(path=child_path, content=False, require_hash=want_hash)
+            except web.HTTPError as e:
+                if e.status_code == 404:
+                    # 与并发删除/隐藏竞争失败,跳过;在 changes 中通报。
+                    continue
+                raise
+            except OSError:
+                continue
+            if want_hash and entry.get("hash") is not None:
+                hashes_computed += 1
+            content.append(entry)
+
+        hashes_deferred = (
+            sum(1 for e in content if e["type"] != "directory" and e["hash"] is None)
+            if require_hash
+            else 0
+        )
+
+        model = self._dir_model(path, content=False)
+        model["content"] = content
+        model["format"] = "json"
+        model["pagination"] = build_pagination_payload(
+            store,
+            snapshot,
+            page_index,
+            raw_names=raw_names,
+            visible_names=visible_names,
+            require_hash=require_hash,
+            hash_budget=hash_budget,
+            hashes_computed=hashes_computed,
+            hashes_deferred=hashes_deferred,
+        )
         self.emit(data={"action": "get", "path": path})
         return model
 
@@ -810,6 +1013,91 @@ class AsyncFileContentsManager(  # type: ignore[misc]
             model = await self._file_model(
                 path, content=content, format=format, require_hash=require_hash
             )
+        self.emit(data={"action": "get", "path": path})
+        return model
+
+    async def get_listing_page(
+        self,
+        path,
+        page_size=None,
+        cursor=None,
+        sort=None,
+        require_hash=False,
+        hash_budget=None,
+    ):
+        """按有界快照游标返回目录清单的一页(异步版本)。
+
+        语义与同步版一致:首页固定排序依据与可见水位,后续页识别破坏
+        连续性的目录变化,权限收紧立即隐藏条目,哈希按预算延迟计算。
+        目录扫描一次性放入线程执行,避免逐条目 await 的额外开销。
+        """
+        path = path.strip("/")
+        os_path = self._validate_listing_request(path, sort, page_size)
+
+        store = self._listing_store
+        try:
+            if cursor is None:
+                if page_size is None:
+                    raise web.HTTPError(400, "page_size is required to start a paginated listing.")
+                sort = sort or "name"
+                raw_names, visible_names = await run_sync(self._scan_listing_dir, os_path, sort)
+                snapshot = store.create(
+                    path=path, names=visible_names, sort=sort, page_size=page_size
+                )
+                page_index = 0
+            else:
+                snapshot, page_index = store.resolve(
+                    cursor, path=path, sort=sort, page_size=page_size
+                )
+                raw_names, visible_names = await run_sync(self._scan_listing_dir, os_path)
+        except PermissionError as e:
+            raise web.HTTPError(403, f"Permission denied while listing directory: {path!r}") from e
+
+        start = page_index * snapshot.page_size
+        page_names = snapshot.names[start : start + snapshot.page_size]
+        visible_set = set(visible_names)
+
+        content = []
+        hashes_computed = 0
+        for name in page_names:
+            if name not in visible_set:
+                # 快照后被删除或权限收紧不再可见;在 changes 中统一通报。
+                continue
+            child_path = f"{path}/{name}" if path else name
+            want_hash = require_hash and (hash_budget is None or hashes_computed < hash_budget)
+            try:
+                entry = await self.get(path=child_path, content=False, require_hash=want_hash)
+            except web.HTTPError as e:
+                if e.status_code == 404:
+                    # 与并发删除/隐藏竞争失败,跳过;在 changes 中通报。
+                    continue
+                raise
+            except OSError:
+                continue
+            if want_hash and entry.get("hash") is not None:
+                hashes_computed += 1
+            content.append(entry)
+
+        hashes_deferred = (
+            sum(1 for e in content if e["type"] != "directory" and e["hash"] is None)
+            if require_hash
+            else 0
+        )
+
+        model = await self._dir_model(path, content=False)
+        model["content"] = content
+        model["format"] = "json"
+        model["pagination"] = build_pagination_payload(
+            store,
+            snapshot,
+            page_index,
+            raw_names=raw_names,
+            visible_names=visible_names,
+            require_hash=require_hash,
+            hash_budget=hash_budget,
+            hashes_computed=hashes_computed,
+            hashes_deferred=hashes_deferred,
+        )
         self.emit(data={"action": "get", "path": path})
         return model
 
